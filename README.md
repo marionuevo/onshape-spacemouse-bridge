@@ -123,27 +123,45 @@ and never leaves this machine.
 
 ## Running it
 
+For a first try, or when actively debugging:
+
 ```sh
-python3 main.py serve
+python3 main.py serve -v
 ```
 
 Leave it running, then open a Part Studio or Assembly (a document with a 3D
-viewport — not the dashboard) in Brave. `-v` for verbose logging; it logs
-each connection's handshake, so you'll see `3dcontroller created
-client=Onshape` and then `navigation active` if everything is wired up.
+viewport — not the dashboard) in Brave. `-v` logs each connection's
+handshake, so you'll see `3dcontroller created client=Onshape` and then
+`navigation active` if everything is wired up.
 
-### Run it in the background (systemd user service)
+### Running it at login (recommended once it's working)
+
+A systemd user service starts it automatically every login and restarts it
+if it ever crashes:
 
 ```sh
 mkdir -p ~/.config/systemd/user
 cp systemd/onshape-spacemouse-bridge.service ~/.config/systemd/user/
 systemctl --user daemon-reload
 systemctl --user enable --now onshape-spacemouse-bridge
-journalctl --user -u onshape-spacemouse-bridge -f   # logs
 ```
 
-Not enabled automatically — run the commands above yourself when you're
-happy it works via `serve` directly.
+`enable --now` both starts it immediately and marks it to start at every
+future login (via `default.target` — this is a plain systemd --user
+service, unrelated to Hyprland/Omarchy's own `exec-once` autostart
+mechanism, and works the same under any desktop). Manage it like any other
+user service:
+
+```sh
+systemctl --user status onshape-spacemouse-bridge     # running? for how long?
+journalctl --user -u onshape-spacemouse-bridge -f     # follow the logs
+systemctl --user restart onshape-spacemouse-bridge    # e.g. after editing the code
+systemctl --user disable --now onshape-spacemouse-bridge  # stop, and stop autostarting
+```
+
+Only one instance can hold port 8181 at a time — stop a manually-run `serve`
+(Ctrl-C, or `pkill -f 'main.py serve'`) before starting the service, and
+vice versa.
 
 ## Troubleshooting
 
