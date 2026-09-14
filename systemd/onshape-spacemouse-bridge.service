@@ -1,0 +1,15 @@
+[Unit]
+Description=SpaceMouse bridge for Onshape (spacenavd -> WAMP/WSS on 127.51.68.120:8181)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 %h/Work/onshape-spacemouse-bridge/main.py serve
+Restart=on-failure
+RestartSec=2
+
+# Ties this instance to spacenavd's presence; harmless if the device is
+# unplugged at boot, the client retries the socket path each launch.
+
+[Install]
+WantedBy=default.target
