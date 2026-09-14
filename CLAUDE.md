@@ -13,11 +13,13 @@ to Onshape's page, so a SpaceMouse drives the camera the same way it does
 on Windows/macOS.
 
 Read `README.md` first — it has the full "why", the setup/troubleshooting
-steps, and a "Performance and smoothness" section explaining two real bugs
-that were fixed (a stale-timestamp bug causing camera jumps, and a
-stuck-rotation bug from `spacenavd` going quiet on release). Don't
-re-introduce either — the fixes are explained there and in the relevant
-docstrings (`drive.py`, `spacenav.py`).
+steps, and a "Performance and smoothness" section explaining the real bugs
+that were fixed (a stale-timestamp bug causing camera jumps, a
+stuck-rotation bug from `spacenavd` going quiet on release, and a later
+round covering certificate renewal, client-version parsing, `delete`
+handling, and shutdown). Don't re-introduce any of them — the fixes are
+explained there and in the relevant docstrings (`drive.py`, `spacenav.py`,
+`certs.py`, `navlib.parse_version`).
 
 ## Commands
 
@@ -36,6 +38,10 @@ python3 main.py serve -v
 # One-time cert generation + Brave/Chrome trust store injection
 python3 main.py gen-certs
 python3 main.py trust
+
+# Optionally restrict which sites may use the bridge (default: any, as the
+# real driver is). Refuses others with 403 at discovery and the WS upgrade.
+python3 main.py serve --allowed-origins https://cad.onshape.com
 
 # Confirm spacenavd is producing events, independent of the browser/WAMP side
 python3 main.py read-mouse
@@ -99,7 +105,9 @@ Things that aren't obvious from any single file:
   with no `rowMajorOrder` field — get the version-based fallback in
   `quirks_for` wrong and every write silently transposes the camera.
   `navlib.canonical`/`from_canonical` are the only places layout conversion
-  should happen.
+  should happen. A version that can't be read is `navlib.UNKNOWN_VERSION`,
+  deliberately distinct from `0.0`: unknown must route to the modern
+  column-major default, never to the pre-0.5 row-major fallback.
 - **`drive.py`'s hot path is fire-and-forget by design.** `Controller.cast_*`
   sends a WAMP write without awaiting the page's acknowledgement — awaiting
   every property read/write in sequence (the naive port from the reference
@@ -113,6 +121,19 @@ Things that aren't obvious from any single file:
   an actual bug (a cache change mid-rotation reads as the camera jumping).
   `view.affine` itself is never cached — it also changes from the user's
   own mouse drag.
+- **Reads that are due together go through `drive._gather`, not sequential
+  awaits.** They're independent properties with their own call ids, so
+  awaiting them in series multiplies latency for nothing. Two rules hold it
+  together: each read gets its *own* deadline (a batch is only as fast as
+  its slowest member, and one property the page never answers would
+  otherwise stall navigation outright), and each is wrapped in a Task up
+  front (raw coroutines handed to `wait_for` are left unawaited if the
+  batch is cancelled first — which happens at every disconnect).
+- **Live WebSockets must be closed on shutdown (`server._close_websockets`,
+  wired to `app.on_shutdown`).** aiohttp waits for handlers to return and
+  `async for msg in ws` never does, so with a browser connected the process
+  ignored SIGTERM until systemd's 90s timeout and SIGKILL. That makes
+  `systemctl --user restart` unusable, so don't drop the tracking set.
 - **`127.51.68.120:8181` cannot be changed** — it's hardcoded in Onshape's
   bundled `3dconnexion.js`. This is also why a locally-generated CA (not a
   public one — CA/Browser Forum rules forbid issuing for loopback IPs) is

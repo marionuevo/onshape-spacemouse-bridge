@@ -63,7 +63,26 @@ wouldn't in a compiled driver. Three changes fixed it, in order of impact:
 3. **Following the client's own frame clock.** Onshape sets
    `frame.timingSource` and drives its own rAF loop; `drive.py` waits on
    that instead of racing a separate ticker task against it every
-   iteration, which cuts needless asyncio task churn too.
+   iteration, which cuts needless asyncio task churn too. How long it waits
+   depends on whether anything is moving: a generous four ticks while
+   moving (absorbing client jitter without our own ticker cutting in and
+   double-stepping), but only one while stopped, where there are no frames
+   to miss and a long wait only delays noticing that the user has touched
+   the puck.
+4. **Issuing independent reads concurrently.** The reads that do remain are
+   sent as one batch (`drive._gather`) rather than awaited one after
+   another. Each carries its own WAMP call id and the page answers them
+   independently, so four sequential round trips were costing four times
+   the latency of one for no benefit. Each read carries its own deadline
+   rather than the batch sharing one — a batch is only ever as fast as its
+   slowest member, and a single property the page accepts but never answers
+   would otherwise stall navigation outright instead of merely leaving one
+   cached value stale.
+
+Between them, a perspective frame costs one blocking round trip
+(`view.affine`) and an orthographic one also costs one, not two. Measured
+on the dead time between deflecting the puck and the first camera write:
+**~83ms down to ~25ms**.
 
 Whether Go instead of Python would help further: probably not much, for
 this specific shape of workload. A compiled binary has lower per-message
@@ -97,6 +116,40 @@ keep streaming), a quiet return to centre may just... stop being reported.
 `Client.state()` now returns a centred `Motion` if nothing has arrived from
 spacenavd in the last 150ms (well over spacenavd's ~8ms/125Hz period),
 instead of trusting a value that might be stale forever.
+
+### Bugs found in a later review
+
+Less visible than the two above, but each a real failure mode:
+
+- **Certificate renewal silently broke browser trust.** `ensure()` runs on
+  every `serve`, and regenerated the CA *and* leaf once the leaf neared
+  expiry. Since both share a subject name, a name-only trust check still
+  reported success while the browser rejected every connection — roughly
+  two years in, the bridge would simply have stopped working. Renewal now
+  re-issues only the leaf, from the existing CA (`certs.renew_leaf`), and
+  `trust` compares the installed CA's DER against the one on disk.
+- **A dotted client version killed the handshake.** `float("0.6.0")` raises,
+  and inside the create handler that became a CALLERROR that aborted the
+  whole handshake with the device appearing dead. `navlib.parse_version`
+  never raises, and an unreadable version is now distinct from `0.0` —
+  falling back on "older than 0.5, so row-major" would silently transpose
+  every camera write.
+- **`delete` followed by a re-subscribe started a second drive loop.**
+  `_handle_delete` cleared only the controller, leaving `_instance_id` set,
+  so a later SUBSCRIBE built a second Controller while the first loop kept
+  writing `view.affine` on its old topic, holding whatever focus it last
+  saw. The handshake state is now fully reset and the running loop stopped.
+- **An unsupported `model.extents` was re-read every frame.** Leaving
+  `have_extents` False kept the read due regardless of its TTL.
+- **The service never shut down while a browser was connected.** aiohttp
+  waits for WebSocket handlers to return, and `async for msg in ws` never
+  does. `systemctl --user restart` therefore sat through the full 90s stop
+  timeout and ended in SIGKILL; `build_app` now closes live sockets in
+  `on_shutdown` (measured: 90s + SIGKILL down to ~0.1s).
+- **Orthographic zoom ignored `--mode camera`.** `sign` was applied twice
+  and cancelled, so an orthographic view zoomed the opposite way from a
+  perspective one for the same gesture. Only affects `--mode camera`; the
+  default `object` mode was correct by coincidence.
 
 ## One-time setup
 
@@ -133,6 +186,21 @@ Leave it running, then open a Part Studio or Assembly (a document with a 3D
 viewport — not the dashboard) in Brave. `-v` logs each connection's
 handshake, so you'll see `3dcontroller created client=Onshape` and then
 `navigation active` if everything is wired up.
+
+Any page your browser loads can open a connection here, exactly as it can to
+the real 3Dconnexion driver — a WebSocket has no same-origin protection, and
+the driver has no way to know which sites are legitimate. In practice a
+connection can only drive its *own* page's camera, and only while that page
+reports having focus, so the exposure is small. If you'd rather lock it down
+anyway:
+
+```sh
+python3 main.py serve --allowed-origins https://cad.onshape.com
+```
+
+Anything else is then refused with a 403 at both the discovery endpoint and
+the WebSocket upgrade. The default stays unrestricted, because an allowlist
+would break any other 3DconnexionJS client you point at it.
 
 ### Running it at login (recommended once it's working)
 
@@ -211,6 +279,9 @@ if a legitimately *held* gesture on your device ever gets mistaken for
 
 **Certificate expired / re-issuing.** `gen-certs` regenerates both CA and
 leaf from scratch, which invalidates the previous trust entry along with it.
+(`trust` checks the installed CA against the one on disk, not just its name,
+so it will tell you when a re-run is genuinely needed and no-op when it
+isn't.)
 Re-run `trust` afterwards. In steady state only the leaf (825 days) needs
 occasional renewal; `serve` regenerates it automatically when it's close to
 expiring, but the *new* leaf is still signed by the *same* CA as long as you

@@ -21,11 +21,12 @@ from onshape_spacemouse_bridge import certs, nav, server
 def cmd_serve(args: argparse.Namespace) -> None:
     cert_dir = Path(args.cert_dir)
     certs.ensure(cert_dir)
-    if not certs.is_trusted_chromium():
+    if not certs.is_trusted_chromium(cert_dir):
         logging.warning(
-            "CA not found in %s -- Brave/Chrome will show a certificate warning "
-            "or fail the discovery request silently. Run: %s trust",
-            certs.NSSDB, sys.argv[0],
+            "the CA in %s is missing or no longer matches %s -- Brave/Chrome will "
+            "show a certificate warning or fail the discovery request silently. "
+            "Run: %s trust",
+            certs.NSSDB, cert_dir / "ca.pem", sys.argv[0],
         )
 
     config = nav.Config(
@@ -35,9 +36,10 @@ def cmd_serve(args: argparse.Namespace) -> None:
         deadzone=args.deadzone,
     )
     buttons = server.parse_buttons(args.buttons) if args.buttons else {}
+    origins = {o.strip() for o in args.allowed_origins.split(",") if o.strip()}
     server.run(
         cert_dir, host=args.host, port=args.port, config=config,
-        frame_rate=args.frame_rate, buttons=buttons,
+        frame_rate=args.frame_rate, buttons=buttons, allowed_origins=origins,
     )
 
 
@@ -50,6 +52,9 @@ def cmd_gen_certs(args: argparse.Namespace) -> None:
 
 def cmd_trust(args: argparse.Namespace) -> None:
     cert_dir = Path(args.cert_dir)
+    if certs.is_trusted_chromium(cert_dir) and not args.force:
+        print(f"'{certs.CA_NAME}' in {certs.NSSDB} already matches {cert_dir / 'ca.pem'}; nothing to do.")
+        return
     if not (cert_dir / "ca.pem").exists():
         print(f"no certificate at {cert_dir} -- run 'gen-certs' first", file=sys.stderr)
         sys.exit(1)
@@ -106,6 +111,11 @@ def main() -> None:
     ps.add_argument("--rotation-speed", type=float, default=1.6)
     ps.add_argument("--deadzone", type=float, default=0.06)
     ps.add_argument("--buttons", default="", help="e.g. 0=fit,1=menu")
+    ps.add_argument(
+        "--allowed-origins", default="",
+        help="comma-separated Origins allowed to use the bridge, e.g. "
+             "https://cad.onshape.com. Default: any, matching the real driver",
+    )
     ps.set_defaults(func=cmd_serve)
 
     pg = sub.add_parser("gen-certs", help="(re)generate the local CA + leaf")

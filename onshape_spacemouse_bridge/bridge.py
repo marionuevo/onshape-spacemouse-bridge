@@ -138,6 +138,7 @@ class Controller:
 
 
 OnReady = Callable[[Controller], Awaitable[None]]
+OnRelease = Callable[[], Awaitable[None]]
 OnFrameTime = Callable[[Controller, float], None]
 OnClientInfo = Callable[[navlib.ClientInfo, navlib.Quirks], None]
 
@@ -153,15 +154,25 @@ class Bridge:
         on_ready: Optional[OnReady] = None,
         on_frame_time: Optional[OnFrameTime] = None,
         on_client_info: Optional[OnClientInfo] = None,
+        on_release: Optional[OnRelease] = None,
     ):
         self.on_ready = on_ready
         self.on_frame_time = on_frame_time
         self.on_client_info = on_client_info
+        self.on_release = on_release
 
         self._connexion_id: Optional[str] = None
         self._instance_id: Optional[str] = None
         self._info: Optional[navlib.ClientInfo] = None
         self.controller: Optional[Controller] = None
+        # An update carrying focus or frame.timingSource can in principle
+        # arrive before the SUBSCRIBE that creates the Controller. The
+        # captured Onshape handshake subscribes first, but dropping those on
+        # the floor if a client ever reorders them is a silent total
+        # failure: focus stays False and the drive loop skips every tick
+        # with the device looking dead. Latch them and apply on subscribe.
+        self._pending_focus: Optional[bool] = None
+        self._pending_timing_source: Optional[bool] = None
 
     async def on_call(self, session: wamp.Session, proc_uri: str, args: list):
         # proc_uri arrives resolved, e.g. "wss://127.51.68.120/3dconnexion#create".
@@ -171,7 +182,7 @@ class Bridge:
         if op == "update":
             return await self._handle_update(args)
         if op == "delete":
-            return self._handle_delete()
+            return await self._handle_delete()
         raise ValueError(f"unknown procedure {proc_uri!r}")
 
     async def _handle_create(self, args: list):
@@ -196,17 +207,23 @@ class Bridge:
 
             info = navlib.ClientInfo(
                 name=info_raw.get("name", ""),
-                version=float(info_raw.get("version", 0) or 0),
+                version=navlib.parse_version(info_raw.get("version")),
                 row_major_order=info_raw.get("rowMajorOrder"),
             )
             self._instance_id = "ctl-" + _short_id()
             self._info = info
             q = navlib.quirks_for(info)
+            if info.version == navlib.UNKNOWN_VERSION:
+                log.warning(
+                    "client %r reported an unreadable version %r; assuming %s matrices",
+                    info.name, info_raw.get("version"), q.layout,
+                )
             log.info(
                 "3dcontroller created instance=%s client=%s clientVersion=%s layout=%s frameTiming=%s",
                 self._instance_id, info.name, info.version, q.layout, q.frame_timing,
             )
-            if info.row_major_order is None and info.version < 0.5:
+            known_version = info.version != navlib.UNKNOWN_VERSION
+            if info.row_major_order is None and known_version and info.version < 0.5:
                 log.warning("client %r predates 3DconnexionJS 0.5; assuming row-major matrices", info.name)
             if self.on_client_info:
                 self.on_client_info(info, q)
@@ -221,17 +238,23 @@ class Bridge:
         c = self.controller
 
         if "focus" in payload:
+            focus = bool(payload["focus"])
             if c is not None:
-                c.set_focus(bool(payload["focus"]))
+                c.set_focus(focus)
+            else:
+                self._pending_focus = focus
             log.debug("client focus=%s", payload["focus"])
 
         frame = payload.get("frame")
-        if isinstance(frame, dict) and c is not None:
+        if isinstance(frame, dict):
             if "timingSource" in frame:
                 on = bool(frame["timingSource"])
-                c.set_client_drives_frames(on)
+                if c is not None:
+                    c.set_client_drives_frames(on)
+                else:
+                    self._pending_timing_source = on
                 log.info("client frame timing clientDriven=%s", on)
-            if "time" in frame:
+            if "time" in frame and c is not None:
                 # Must return promptly: the page is waiting on this reply
                 # with roughly a 60ms budget before it abandons its
                 # animation loop. c.notify_frame_time never blocks.
@@ -242,9 +265,25 @@ class Bridge:
 
         return {}
 
-    def _handle_delete(self):
+    async def _handle_delete(self):
+        """Release everything the handshake set up.
+
+        Clearing only `self.controller` is not enough: `_instance_id` would
+        survive, so a later SUBSCRIBE passes both guards in `on_subscribe`
+        and builds a *second* Controller while the drive loop for the first
+        is still running -- two loops writing view.affine on different
+        topics, the orphan keeping the focus it was last told about because
+        subsequent updates only ever reach the current controller.
+        """
         log.info("client released the 3dmouse")
         self.controller = None
+        self._connexion_id = None
+        self._instance_id = None
+        self._info = None
+        self._pending_focus = None
+        self._pending_timing_source = None
+        if self.on_release:
+            await self.on_release()
         return {}
 
     async def on_subscribe(self, session: wamp.Session, topic: str) -> None:
@@ -254,6 +293,12 @@ class Bridge:
         if self.controller is not None:
             return
         c = Controller(session, topic, self._instance_id, self._info)
+        if self._pending_focus is not None:
+            c.set_focus(self._pending_focus)
+        if self._pending_timing_source is not None:
+            c.set_client_drives_frames(self._pending_timing_source)
+        self._pending_focus = None
+        self._pending_timing_source = None
         self.controller = c
         log.info("controller subscribed topic=%s", topic)
         if self.on_ready:

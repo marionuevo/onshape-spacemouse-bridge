@@ -13,6 +13,7 @@ import socket
 import struct
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass
 from typing import Optional, Union
 
@@ -23,6 +24,7 @@ _EV_BUTTON_PRESS = 1
 _EV_BUTTON_RELEASE = 2
 
 _EVENT_SIZE = 32  # 8 x int32
+_EVENT_QUEUE = 256  # events retained between poll_events() calls
 _STRUCT = struct.Struct("<8i")
 
 
@@ -107,6 +109,7 @@ class Client:
                 sock, chosen = s, p
                 break
             except OSError as e:
+                s.close()
                 last_err = e
         if sock is None:
             raise RuntimeError(
@@ -120,7 +123,13 @@ class Client:
         self._lock = threading.Lock()
         self._latest = Motion()
         self._latest_at = 0.0
-        self._events: list[Event] = []
+        # A bounded deque, not a list: at ~125Hz motion dominates the queue,
+        # and dropping the oldest from a list is O(n) on every overflow.
+        # Dropping the oldest (rather than refusing the newest) matters -- a
+        # consumer watching for a state change such as the return to centre
+        # would otherwise be served a stale backlog while the event it wants
+        # is thrown away.
+        self._events: deque[Event] = deque(maxlen=_EVENT_QUEUE)
         self._dead = threading.Event()
         self._closed = threading.Event()
         self._thread = threading.Thread(target=self._read_loop, daemon=True)
@@ -145,12 +154,6 @@ class Client:
                             self._latest = ev
                             self._latest_at = time.monotonic()
                         self._events.append(ev)
-                        if len(self._events) > 256:
-                            # Drop the oldest: a consumer watching for a state
-                            # change (return to centre, say) would otherwise
-                            # be served a stale backlog while the event it
-                            # wants is thrown away.
-                            self._events.pop(0)
         except OSError:
             pass
         finally:
@@ -187,8 +190,8 @@ class Client:
         call. Buttons live here; do not rely on this for motion timing.
         """
         with self._lock:
-            evs, self._events = self._events, []
-        return evs
+            evs, self._events = self._events, deque(maxlen=_EVENT_QUEUE)
+        return list(evs)
 
     def is_dead(self) -> bool:
         return self._dead.is_set()

@@ -80,6 +80,16 @@ class Config:
             a = a ** self.exponent
         return math.copysign(a, n)
 
+    def shape(self, m: Motion) -> dict:
+        """The six axes after clamp/deadzone/curve, keyed x,y,z,rx,ry,rz.
+
+        Public so a caller can shape once per frame and hand the result to
+        both `shape_is_zero` and `step` -- the loop tests for deadzone before
+        spending a round trip on the client, and re-shaping afterwards would
+        do the same work twice.
+        """
+        return self._shape_all(m)
+
     def _shape_all(self, m: Motion) -> dict:
         rot_scale = self.rotation_full_scale if self.rotation_full_scale > 0 else self.full_scale
         a = {
@@ -94,16 +104,21 @@ class Config:
             a = _keep_largest(a)
         return a
 
-    def shape_is_zero(self, m: Motion) -> bool:
+    def shape_is_zero(self, m: Motion, shaped: Optional[dict] = None) -> bool:
         """Whether the input falls entirely inside the deadzone. Call this
         before reading anything from the client: when the user isn't
-        touching the device there's no reason to spend a round trip.
+        touching the device there's no reason to spend a round trip. Pass
+        `shaped` from `shape()` to avoid shaping the same sample twice.
         """
-        return all(v == 0 for v in self._shape_all(m).values())
+        a = shaped if shaped is not None else self._shape_all(m)
+        return all(v == 0 for v in a.values())
 
-    def step(self, m: Motion, dt_seconds: float, scene: "Scene") -> "Result":
+    def step(self, m: Motion, dt_seconds: float, scene: "Scene", shaped: Optional[dict] = None) -> "Result":
         """Compute the next camera pose. `result.moved` is False when the
         input was inside the deadzone and the camera should be left alone.
+
+        `shaped` is an optional pre-computed `shape()` result for this same
+        sample; passing it skips a second pass over the six axes.
 
         Device axes are Z-up right-handed (X right, Y away, Z up); the
         camera frame is OpenGL's (X right, Y up, -Z forward), which is what
@@ -111,7 +126,7 @@ class Config:
         mapping is encoded.
         """
         out = Result(camera=list(scene.camera))
-        a = self._shape_all(m)
+        a = shaped if shaped is not None else self._shape_all(m)
         if all(v == 0 for v in a.values()):
             return out
         if dt_seconds <= 0:
@@ -143,12 +158,19 @@ class Config:
             ortho = (not scene.perspective) and not navlib.box_empty(scene.view_extents)
             if ortho:
                 # Dollying an orthographic camera is a no-op on screen; the
-                # equivalent is scaling the view box. Positive camera-local Z
-                # is backwards, away from the subject, so it zooms out.
-                zoom_in = local[2]
+                # equivalent is scaling the view box. Positive camera-local
+                # Z is backwards, away from the subject, so a positive
+                # `back` is the dolly that would zoom out -- and the
+                # equivalent here is growing the view box.
+                # `back` already carries `sign` (and the device-axis flip)
+                # from `scale` above; re-applying either here cancels it,
+                # which is what used to leave orthographic zoom pointing the
+                # same way in both modes while the perspective dolly
+                # correctly flipped with the mode.
+                back = local[2]
                 local[2] = 0
-                if zoom_in != 0:
-                    f = math.exp(self.zoom_speed * sign * -zoom_in / (self.translation_speed * diagonal))
+                if back != 0:
+                    f = math.exp(self.zoom_speed * back / (self.translation_speed * diagonal))
                     out.extents = navlib.box_scaled(scene.view_extents, f)
                     out.extents_changed = True
                     out.moved = True

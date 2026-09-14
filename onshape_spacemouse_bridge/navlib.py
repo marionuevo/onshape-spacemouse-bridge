@@ -44,6 +44,8 @@ PROC_UPDATE = "self:update"
 V3DK_MENU = 0x1E
 V3DK_FIT = 0x1F
 
+UNKNOWN_VERSION = -1.0  # ClientInfo.version when it could not be read
+
 LAYOUT_COLUMN_MAJOR = "column-major"
 LAYOUT_ROW_MAJOR = "row-major"
 
@@ -55,8 +57,39 @@ class ClientInfo:
     """
 
     name: str = ""
-    version: float = 0.0
+    version: float = UNKNOWN_VERSION  # see parse_version
     row_major_order: Optional[bool] = None
+
+
+def parse_version(raw) -> float:
+    """Best-effort "major.minor" from whatever the client put in its info,
+    or UNKNOWN_VERSION if it can't be read at all.
+
+    3DconnexionJS sends a JSON number today, but the field is free-form and
+    a dotted string ("0.6.0") is the obvious other shape. `float()` alone
+    raises on that, and since this is parsed inside the create handler the
+    exception becomes a CALLERROR that kills the whole handshake -- the
+    device simply appears dead, with the cause buried. Never raise.
+
+    Unknown is deliberately distinct from 0.0. Absent a version, `quirks_for`
+    falls back on "older than 0.5, so row-major", which is right for a
+    genuinely ancient client but is the worst possible guess for a modern
+    one whose version string merely didn't parse -- every write would
+    silently transpose the camera. UNKNOWN_VERSION routes to the modern
+    default instead.
+    """
+    if isinstance(raw, bool):
+        return UNKNOWN_VERSION
+    if isinstance(raw, (int, float)):
+        return float(raw)
+    if isinstance(raw, str):
+        parts = raw.strip().split(".")
+        head = ".".join(parts[:2]) if len(parts) > 1 else (parts[0] if parts else "")
+        try:
+            return float(head)
+        except ValueError:
+            pass
+    return UNKNOWN_VERSION
 
 
 @dataclass
@@ -73,10 +106,11 @@ class Quirks:
 
 
 def quirks_for(info: ClientInfo) -> Quirks:
-    q = Quirks(layout=LAYOUT_COLUMN_MAJOR, frame_timing=info.version >= 0.6)
+    known = info.version != UNKNOWN_VERSION
+    q = Quirks(layout=LAYOUT_COLUMN_MAJOR, frame_timing=known and info.version >= 0.6)
     if info.row_major_order is not None:
         q.layout = LAYOUT_ROW_MAJOR if info.row_major_order else LAYOUT_COLUMN_MAJOR
-    elif info.version < 0.5:
+    elif known and info.version < 0.5:
         q.layout = LAYOUT_ROW_MAJOR
     return q
 
